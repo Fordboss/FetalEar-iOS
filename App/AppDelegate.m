@@ -14,12 +14,15 @@
 @property (nonatomic, strong) AVAudioPlayerNode *player;
 @property (nonatomic, assign) BOOL running;
 // 参数（跨线程原子访问）
-@property (atomic, assign) float gain;        // 0.5 ~ 6.0
-@property (atomic, assign) BOOL bandPass;     // YES: 80~1000Hz带通, NO: 仅40Hz高通
+@property (atomic, assign) float gain;        // 0.5 ~ 10.0
+// 滤波模式：0=原始(仅40Hz高通去直流) 1=宽带80~1kHz 2=心跳20~250Hz（默认）
+@property (atomic, assign) NSInteger filterMode;
 // 滤波系数（按实际采样率在启动时计算）
 @property (atomic, assign) float aH40;
 @property (atomic, assign) float aH80;
+@property (atomic, assign) float aH20;
 @property (atomic, assign) float aL1k;
+@property (atomic, assign) float aL250;
 // 滤波状态（仅音频回调线程访问，最多2声道）
 // （已改为实例变量，见类扩展块）
 // UI（window 已在 AppDelegate.h 声明）
@@ -27,15 +30,15 @@
 @property (nonatomic, strong) UIButton *toggleButton;
 @property (nonatomic, strong) UISlider *gainSlider;
 @property (nonatomic, strong) UILabel *gainLabel;
-@property (nonatomic, strong) UISwitch *bandPassSwitch;
+@property (nonatomic, strong) UISegmentedControl *filterSeg;
 @end
 
 @implementation AppDelegate
 
 - (BOOL)application:(UIApplication *)app
         didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
-    self.gain = 2.0f;
-    self.bandPass = YES;
+    self.gain = 3.0f;
+    self.filterMode = 2;
 
     self.window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
     UIViewController *vc = [UIViewController new];
@@ -103,35 +106,36 @@
 
     self.gainSlider = [[UISlider alloc] initWithFrame:CGRectMake(32, 280, w - 64, 36)];
     self.gainSlider.minimumValue = 0.5f;
-    self.gainSlider.maximumValue = 6.0f;
-    self.gainSlider.value = 2.0f;
+    self.gainSlider.maximumValue = 10.0f;
+    self.gainSlider.value = 3.0f;
     [self.gainSlider addTarget:self action:@selector(onGainChange:) forControlEvents:UIControlEventValueChanged];
     [root addSubview:self.gainSlider];
 
     self.gainLabel = [[UILabel alloc] initWithFrame:CGRectMake(32, 318, w - 64, 22)];
-    self.gainLabel.text = @"200%";
+    self.gainLabel.text = @"300%";
     self.gainLabel.font = [UIFont systemFontOfSize:14];
     self.gainLabel.textAlignment = NSTextAlignmentCenter;
     self.gainLabel.textColor = [UIColor secondaryLabelColor];
     [root addSubview:self.gainLabel];
 
-    UILabel *bpTitle = [[UILabel alloc] initWithFrame:CGRectMake(32, 366, w - 64 - 60, 30)];
-    bpTitle.text = @"带通滤波（80~1000Hz）";
+    UILabel *bpTitle = [[UILabel alloc] initWithFrame:CGRectMake(32, 366, w - 64, 22)];
+    bpTitle.text = @"滤波模式";
     bpTitle.font = [UIFont systemFontOfSize:16];
     [root addSubview:bpTitle];
 
-    self.bandPassSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(w - 92, 366, 60, 30)];
-    self.bandPassSwitch.on = YES;
-    [self.bandPassSwitch addTarget:self action:@selector(onBandPassChange:) forControlEvents:UIControlEventValueChanged];
-    [root addSubview:self.bandPassSwitch];
+    self.filterSeg = [[UISegmentedControl alloc] initWithItems:@[@"心跳 20~250Hz", @"宽带 80~1kHz", @"原始"]];
+    self.filterSeg.frame = CGRectMake(32, 396, w - 64, 34);
+    self.filterSeg.selectedSegmentIndex = 0;
+    [self.filterSeg addTarget:self action:@selector(onFilterChange:) forControlEvents:UIControlEventValueChanged];
+    [root addSubview:self.filterSeg];
 
-    UITextView *notes = [[UITextView alloc] initWithFrame:CGRectMake(24, 420, w - 48, 240)];
+    UITextView *notes = [[UITextView alloc] initWithFrame:CGRectMake(24, 450, w - 48, 240)];
     notes.editable = NO;
     notes.scrollEnabled = NO;
     notes.backgroundColor = [UIColor clearColor];
     notes.font = [UIFont systemFontOfSize:13];
     notes.textColor = [UIColor secondaryLabelColor];
-    notes.text = @"使用说明：\n1. 先连接蓝牙耳机，再点「开始监听」\n2. iPhone 麦克风贴近声源（胎心仪探头或腹部）\n3. 蓝牙链路有约0.2~0.4秒延迟，属正常现象\n4. 增益过大可能啸叫，注意扬声器音量\n5. 仅实时监听辅助，不录音不上传，不替代医疗诊断";
+    notes.text = @"使用说明：\n1. 先连接蓝牙耳机，再点「开始监听」\n2. 默认「心跳模式」专收低频心音，环境声大时用它\n3. 麦克风孔压紧身体、手掌罩住密封，安静房间\n4. 蓝牙链路有约0.2~0.4秒延迟，属正常现象\n5. 增益过大可能啸叫，注意扬声器音量\n6. 仅实时监听辅助，不录音不上传，不替代医疗诊断";
     [root addSubview:notes];
 }
 
@@ -186,8 +190,10 @@
     double sr = inFmt.sampleRate;
     self.aH40 = (float)exp(-2.0 * M_PI * 40.0 / sr);
     self.aH80 = (float)exp(-2.0 * M_PI * 80.0 / sr);
+    self.aH20 = (float)exp(-2.0 * M_PI * 20.0 / sr);
     self.aL1k = (float)(1.0 - exp(-2.0 * M_PI * 1000.0 / sr));
-    NSLog(@"[FetalEar] sr=%.0f aH40=%.4f aH80=%.4f aL1k=%.4f", sr, self.aH40, self.aH80, self.aL1k);
+    self.aL250 = (float)(1.0 - exp(-2.0 * M_PI * 250.0 / sr));
+    NSLog(@"[FetalEar] sr=%.0f aH20=%.4f aH80=%.4f aL250=%.4f aL1k=%.4f", sr, self.aH20, self.aH80, self.aL250, self.aL1k);
 
     // 滤波状态清零
     memset(_filtXP, 0, sizeof(_filtXP));
@@ -244,10 +250,23 @@
     float **channels = buf.floatChannelData;
     NSUInteger frames = buf.frameLength;
     float g = self.gain;
-    BOOL bp = self.bandPass;
-    float aH = bp ? self.aH80 : self.aH40;
-    BOOL useLp = bp;
-    float aL = self.aL1k;
+    NSInteger mode = self.filterMode;
+    float aH;
+    float aL;
+    BOOL useLp;
+    if (mode == 2) {
+        aH = self.aH20;   // 心跳模式：20~250Hz
+        aL = self.aL250;
+        useLp = YES;
+    } else if (mode == 1) {
+        aH = self.aH80;   // 宽带：80~1000Hz
+        aL = self.aL1k;
+        useLp = YES;
+    } else {
+        aH = self.aH40;   // 原始：仅去直流
+        aL = 0.0f;
+        useLp = NO;
+    }
 
     for (NSUInteger c = 0; c < buf.format.channelCount && c < 2; c++) {
         float *p = channels[c];
@@ -327,9 +346,9 @@
     self.gainLabel.text = [NSString stringWithFormat:@"%d%%", pct];
 }
 
-- (void)onBandPassChange:(UISwitch *)sw {
-    self.bandPass = sw.on;
-    NSLog(@"[FetalEar] 带通滤波: %@", sw.on ? @"开" : @"关");
+- (void)onFilterChange:(UISegmentedControl *)seg {
+    self.filterMode = seg.selectedSegmentIndex;
+    NSLog(@"[FetalEar] 滤波模式: %ld", (long)seg.selectedSegmentIndex);
 }
 
 @end
