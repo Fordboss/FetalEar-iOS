@@ -39,7 +39,7 @@
     CGFloat h = self.bounds.size.height;
     CGFloat midY = h / 2.0;
 
-    [UIColor colorWithWhite:0 alpha:0.25] set;
+    [[UIColor colorWithWhite:0 alpha:0.25] set];
     UIBezierPath *base = [UIBezierPath bezierPath];
     [base moveToPoint:CGPointMake(0, midY)];
     [base addLineToPoint:CGPointMake(w, midY)];
@@ -332,7 +332,7 @@
 
 - (NSURL *)recordingsDir {
     NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-    NSURL *dir = [docs URLByAppendingPathComponent:@"Recordings"];
+    NSURL *dir = [NSURL fileURLWithPath:[docs stringByAppendingPathComponent:@"Recordings"]];
     [[NSFileManager defaultManager] createDirectoryAtURL:dir withIntermediateDirectories:YES attributes:nil error:nil];
     return dir;
 }
@@ -655,7 +655,8 @@
         if (buf == nil) return;
         [f readIntoBuffer:buf error:&err];
         float *ch = buf.floatChannelData[0];
-        float peaks[600];
+        float *peaks = (float *)malloc(600 * sizeof(float));
+        if (peaks == NULL) return;
         AVAudioFrameCount n = buf.frameLength;
         for (int i = 0; i < 600; i++) {
             AVAudioFrameCount s = (AVAudioFrameCount)(((int64_t)i) * n / 600);
@@ -669,6 +670,7 @@
         }
         dispatch_async(dispatch_get_main_queue(), ^{
             [self.playWave setData:peaks length:600 level:0];
+            free(peaks);
         });
     });
     NSError *perr = nil;
