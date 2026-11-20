@@ -22,8 +22,7 @@
 @property (atomic, assign) float aL1k;
 // 滤波状态（仅音频回调线程访问，最多2声道）
 // （已改为实例变量，见类扩展块）
-// UI
-@property (nonatomic, strong) UIWindow *window;
+// UI（window 已在 AppDelegate.h 声明）
 @property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, strong) UIButton *toggleButton;
 @property (nonatomic, strong) UISlider *gainSlider;
