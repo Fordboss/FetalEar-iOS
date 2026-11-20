@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- 沙盒外运行（TrollStore 应用标准配置） -->
+	<key>platform-application</key>
+	<true/>
+	<key>com.apple.private.security.no-container</key>
+	<true/>
+
+	<!-- 麦克风 TCC 白名单（新系统不一定生效，仍要在 Info.plist 写用途说明） -->
+	<key>com.apple.private.tcc.allow</key>
+	<array>
+		<string>kTCCServiceMicrophone</string>
+	</array>
+	<key>com.apple.private.tcc.manager.check-by-audit-token</key>
+	<array>
+		<string>kTCCServiceMicrophone</string>
+	</array>
+
+	<!-- 调试用 -->
+	<key>get-task-allow</key>
+	<true/>
+</dict>
+</plist>
