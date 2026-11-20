@@ -3,6 +3,12 @@
 #import <math.h>
 
 @interface AppDelegate () <AVAudioSessionDelegate>
+{
+    // 滤波状态（仅音频回调线程访问，最多2声道）
+    float _filtXP[2];
+    float _filtYPH[2];
+    float _filtYPL[2];
+}
 // 音频
 @property (nonatomic, strong) AVAudioEngine *engine;
 @property (nonatomic, strong) AVAudioPlayerNode *player;
@@ -15,9 +21,7 @@
 @property (atomic, assign) float aH80;
 @property (atomic, assign) float aL1k;
 // 滤波状态（仅音频回调线程访问，最多2声道）
-@property (nonatomic, assign) float xp[2];
-@property (nonatomic, assign) float ypH[2];
-@property (nonatomic, assign) float ypL[2];
+// （已改为实例变量，见类扩展块）
 // UI
 @property (nonatomic, strong) UIWindow *window;
 @property (nonatomic, strong) UILabel *statusLabel;
@@ -42,21 +46,12 @@
     [self buildUI:vc];
 
     // 权限申请放在 UI 出来之后
-    if (@available(iOS 17.0, *)) {
-        [AVAudioApplication requestRecordPermission:^(BOOL granted) {
-            NSLog(@"[FetalEar] 麦克风权限: %@", granted ? @"已授权" : @"被拒绝");
-            dispatch_async(dispatch_get_main_queue(), ^{
-                if (!granted) self.statusLabel.text = @"麦克风权限被拒绝，请在 设置→隐私→麦克风 中开启";
-            });
-        }];
-    } else {
-        [AVAudioSession.sharedInstance requestRecordPermission:^(BOOL granted) {
-            NSLog(@"[FetalEar] 麦克风权限: %@", granted ? @"已授权" : @"被拒绝");
-            dispatch_async(dispatch_get_main_queue(), ^{
-                if (!granted) self.statusLabel.text = @"麦克风权限被拒绝，请在 设置→隐私→麦克风 中开启";
-            });
-        }];
-    }
+    [AVAudioSession.sharedInstance requestRecordPermission:^(BOOL granted) {
+        NSLog(@"[FetalEar] 麦克风权限: %@", granted ? @"已授权" : @"被拒绝");
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!granted) self.statusLabel.text = @"麦克风权限被拒绝，请在 设置→隐私→麦克风 中开启";
+        });
+    }];
 
     // 监听蓝牙连接/断开等路由变化
     [[NSNotificationCenter defaultCenter] addObserver:self
@@ -66,7 +61,7 @@
     // 引擎配置变化（插拔耳机导致重配置时引擎会自动停，需要重启）
     [[NSNotificationCenter defaultCenter] addObserver:self
                                              selector:@selector(onEngineConfigChange:)
-                                                 name:AVAudioEngineConfigurationChange
+                                                 name:AVAudioEngineConfigurationChangeNotification
                                                object:self.engine];
 
     return YES;
@@ -196,9 +191,9 @@
     NSLog(@"[FetalEar] sr=%.0f aH40=%.4f aH80=%.4f aL1k=%.4f", sr, self.aH40, self.aH80, self.aL1k);
 
     // 滤波状态清零
-    memset(self.xp, 0, sizeof(self.xp));
-    memset(self.ypH, 0, sizeof(self.ypH));
-    memset(self.ypL, 0, sizeof(self.ypL));
+    memset(_filtXP, 0, sizeof(_filtXP));
+    memset(_filtYPH, 0, sizeof(_filtYPH));
+    memset(_filtYPL, 0, sizeof(_filtYPL));
 
     __weak typeof(self) wself = self;
     [self.engine.inputNode installTapOnBus:0 bufferSize:1024 format:inFmt
@@ -207,7 +202,8 @@
     }];
 
     err = nil;
-    ok = [self.engine prepareAndReturnError:&err] && [self.engine startAndReturnError:&err];
+    [self.engine prepare];
+    ok = [self.engine startAndReturnError:&err];
     if (!ok) {
         NSLog(@"[FetalEar] 引擎启动失败: %@", err);
         [self setStatus:[NSString stringWithFormat:@"引擎启动失败: %@", err.localizedDescription]];
@@ -256,9 +252,9 @@
 
     for (NSUInteger c = 0; c < buf.format.channelCount && c < 2; c++) {
         float *p = channels[c];
-        float xp = self.xp[c];
-        float ypH = self.ypH[c];
-        float ypL = self.ypL[c];
+        float xp = _filtXP[c];
+        float ypH = _filtYPH[c];
+        float ypL = _filtYPL[c];
         for (NSUInteger i = 0; i < frames; i++) {
             float x = p[i];
             float y = x - xp + aH * ypH;
@@ -273,9 +269,9 @@
             else if (v < -1.0f) v = -1.0f;
             p[i] = v;
         }
-        self.xp[c] = xp;
-        self.ypH[c] = ypH;
-        self.ypL[c] = ypL;
+        _filtXP[c] = xp;
+        _filtYPH[c] = ypH;
+        _filtYPL[c] = ypL;
     }
 
     // 就地回放（处理后的同一个buffer调度到播放节点）
