@@ -1,13 +1,90 @@
 #import "AppDelegate.h"
 #import <AVFoundation/AVFoundation.h>
+#import <UIKit/UIKit.h>
 #import <math.h>
 
-@interface AppDelegate () <AVAudioSessionDelegate>
+#pragma mark - WaveView（实时/回放波形显示）
+
+@interface WaveView : UIView
+- (void)setData:(const float *)d length:(NSUInteger)n level:(float)rms;
+@end
+
+@implementation WaveView {
+    float _data[600];
+    NSUInteger _n;
+    float _level;
+}
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (self) {
+        self.backgroundColor = [UIColor colorWithWhite:0 alpha:0.04];
+        _n = 0;
+        _level = 0;
+        memset(_data, 0, sizeof(_data));
+    }
+    return self;
+}
+
+- (void)setData:(const float *)d length:(NSUInteger)n level:(float)rms {
+    if (n > 600) n = 600;
+    if (d != NULL && n > 0) memcpy(_data, d, n * sizeof(float));
+    _n = n;
+    _level = rms;
+    [self setNeedsDisplay];
+}
+
+- (void)drawRect:(CGRect)rect {
+    CGFloat w = self.bounds.size.width;
+    CGFloat h = self.bounds.size.height;
+    CGFloat midY = h / 2.0;
+
+    [UIColor colorWithWhite:0 alpha:0.25] set;
+    UIBezierPath *base = [UIBezierPath bezierPath];
+    [base moveToPoint:CGPointMake(0, midY)];
+    [base addLineToPoint:CGPointMake(w, midY)];
+    base.lineWidth = 1.0;
+    [base stroke];
+
+    if (_n > 1) {
+        [[UIColor colorWithRed:0.18 green:0.49 blue:0.20 alpha:1] setStroke];
+        UIBezierPath *p = [UIBezierPath bezierPath];
+        CGFloat amp = h / 2.0 * 0.92;
+        for (NSUInteger i = 0; i < _n; i++) {
+            CGFloat x = w * (CGFloat)i / (CGFloat)(_n - 1);
+            float v = _data[i];
+            if (v > 1) v = 1; else if (v < -1) v = -1;
+            CGFloat y = midY - v * amp;
+            if (i == 0) [p moveToPoint:CGPointMake(x, y)];
+            else [p addLineToPoint:CGPointMake(x, y)];
+        }
+        p.lineWidth = 2.0;
+        [p stroke];
+    }
+
+    // 底部电平条
+    CGFloat barW = MAX(0, MIN(1, _level * 4.0f)) * w;
+    [[UIColor colorWithRed:0.08 green:0.40 blue:0.75 alpha:1] setFill];
+    UIBezierPath *bar = [UIBezierPath bezierPathWithRect:CGRectMake(0, h - 8, barW, 8)];
+    [bar fill];
+}
+
+@end
+
+#pragma mark - AppDelegate
+
+@interface AppDelegate () <AVAudioSessionDelegate, AVAudioPlayerDelegate>
 {
     // 滤波状态（仅音频回调线程访问，最多2声道）
     float _filtXP[2];
     float _filtYPH[2];
     float _filtYPL[2];
+    // 实时波形环（回调写，UI读，锁保护）
+    float _waveRing[1200];
+    NSInteger _wavePos;
+    NSLock *_waveLock;
+    float _level;
+    AVAudioFormat *_inFmt; // 强引用输入格式
 }
 // 音频
 @property (nonatomic, strong) AVAudioEngine *engine;
@@ -17,20 +94,32 @@
 @property (atomic, assign) float gain;        // 0.5 ~ 10.0
 // 滤波模式：0=原始(仅40Hz高通去直流) 1=宽带80~1kHz 2=心跳20~250Hz（默认）
 @property (atomic, assign) NSInteger filterMode;
+// 录音
+@property (atomic, assign) BOOL recording;
+@property (atomic, strong) AVAudioFile *recFile;
+@property (atomic, strong) NSURL *recURL;
+// 回放
+@property (nonatomic, strong) AVAudioPlayer *audioPlayer;
 // 滤波系数（按实际采样率在启动时计算）
 @property (atomic, assign) float aH40;
 @property (atomic, assign) float aH80;
 @property (atomic, assign) float aH20;
 @property (atomic, assign) float aL1k;
 @property (atomic, assign) float aL250;
-// 滤波状态（仅音频回调线程访问，最多2声道）
-// （已改为实例变量，见类扩展块）
 // UI（window 已在 AppDelegate.h 声明）
 @property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, strong) UIButton *toggleButton;
 @property (nonatomic, strong) UISlider *gainSlider;
 @property (nonatomic, strong) UILabel *gainLabel;
 @property (nonatomic, strong) UISegmentedControl *filterSeg;
+@property (nonatomic, strong) WaveView *liveWave;
+@property (nonatomic, strong) UISlider *zoomSlider;
+@property (nonatomic, strong) UILabel *zoomValueLabel;
+@property (nonatomic, strong) UISwitch *recordSwitch;
+@property (nonatomic, strong) UILabel *recFileLabel;
+@property (nonatomic, strong) UIButton *playButton;
+@property (nonatomic, strong) WaveView *playWave;
+@property (nonatomic, strong) NSTimer *uiTimer;
 @end
 
 @implementation AppDelegate
@@ -39,6 +128,9 @@
         didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     self.gain = 3.0f;
     self.filterMode = 2;
+    _waveLock = [[NSLock alloc] init];
+    _wavePos = 0;
+    memset(_waveRing, 0, sizeof(_waveRing));
 
     self.window = [[UIWindow alloc] initWithFrame:UIScreen.mainScreen.bounds];
     UIViewController *vc = [UIViewController new];
@@ -66,6 +158,13 @@
                                                  name:AVAudioEngineConfigurationChangeNotification
                                                object:self.engine];
 
+    // UI 刷新定时器：约30fps
+    __weak typeof(self) wself = self;
+    self.uiTimer = [NSTimer timerWithTimeInterval:1.0 / 30.0 repeats:YES block:^(NSTimer *t) {
+        [wself refreshWaveUI];
+    }];
+    [[NSRunLoop mainRunLoop] addTimer:self.uiTimer forMode:NSRunLoopCommonModes];
+
     return YES;
 }
 
@@ -75,68 +174,150 @@
     UIView *root = vc.view;
     CGFloat w = root.bounds.size.width;
 
-    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(0, 70, w, 34)];
+    // 整页滚动容器（控件多，小屏也能滚到底）
+    UIScrollView *scroll = [[UIScrollView alloc] initWithFrame:root.bounds];
+    scroll.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    scroll.alwaysBounceVertical = YES;
+    [root addSubview:scroll];
+    UIView *content = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, 960)];
+    scroll.contentSize = CGSizeMake(w, 960);
+    [scroll addSubview:content];
+
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(0, 24, w, 34)];
     title.text = @"胎心耳返";
     title.font = [UIFont systemFontOfSize:26 weight:UIFontWeightBold];
     title.textAlignment = NSTextAlignmentCenter;
-    [root addSubview:title];
+    [content addSubview:title];
 
-    self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 116, w - 32, 44)];
+    self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(16, 64, w - 32, 40)];
     self.statusLabel.text = @"未运行 · 先连接蓝牙耳机";
     self.statusLabel.font = [UIFont systemFontOfSize:14];
     self.statusLabel.textAlignment = NSTextAlignmentCenter;
     self.statusLabel.numberOfLines = 2;
     self.statusLabel.textColor = [UIColor secondaryLabelColor];
-    [root addSubview:self.statusLabel];
+    [content addSubview:self.statusLabel];
 
     self.toggleButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    self.toggleButton.frame = CGRectMake(32, 172, w - 64, 56);
+    self.toggleButton.frame = CGRectMake(32, 112, w - 64, 52);
     self.toggleButton.layer.cornerRadius = 12;
     self.toggleButton.backgroundColor = [UIColor systemBlueColor];
     self.toggleButton.tintColor = [UIColor whiteColor];
     self.toggleButton.titleLabel.font = [UIFont systemFontOfSize:18 weight:UIFontWeightSemibold];
     [self.toggleButton setTitle:@"开始监听" forState:UIControlStateNormal];
     [self.toggleButton addTarget:self action:@selector(onToggle) forControlEvents:UIControlEventTouchUpInside];
-    [root addSubview:self.toggleButton];
+    [content addSubview:self.toggleButton];
 
-    UILabel *gainTitle = [[UILabel alloc] initWithFrame:CGRectMake(32, 250, w - 64, 22)];
+    UILabel *gainTitle = [[UILabel alloc] initWithFrame:CGRectMake(32, 180, w - 64, 22)];
     gainTitle.text = @"增益（音量放大倍数）";
     gainTitle.font = [UIFont systemFontOfSize:15];
-    [root addSubview:gainTitle];
+    [content addSubview:gainTitle];
 
-    self.gainSlider = [[UISlider alloc] initWithFrame:CGRectMake(32, 280, w - 64, 36)];
+    self.gainSlider = [[UISlider alloc] initWithFrame:CGRectMake(32, 206, w - 64, 36)];
     self.gainSlider.minimumValue = 0.5f;
     self.gainSlider.maximumValue = 10.0f;
     self.gainSlider.value = 3.0f;
     [self.gainSlider addTarget:self action:@selector(onGainChange:) forControlEvents:UIControlEventValueChanged];
-    [root addSubview:self.gainSlider];
+    [content addSubview:self.gainSlider];
 
-    self.gainLabel = [[UILabel alloc] initWithFrame:CGRectMake(32, 318, w - 64, 22)];
+    self.gainLabel = [[UILabel alloc] initWithFrame:CGRectMake(32, 244, w - 64, 20)];
     self.gainLabel.text = @"300%";
     self.gainLabel.font = [UIFont systemFontOfSize:14];
     self.gainLabel.textAlignment = NSTextAlignmentCenter;
     self.gainLabel.textColor = [UIColor secondaryLabelColor];
-    [root addSubview:self.gainLabel];
+    [content addSubview:self.gainLabel];
 
-    UILabel *bpTitle = [[UILabel alloc] initWithFrame:CGRectMake(32, 366, w - 64, 22)];
-    bpTitle.text = @"滤波模式";
-    bpTitle.font = [UIFont systemFontOfSize:16];
-    [root addSubview:bpTitle];
+    UILabel *filterTitle = [[UILabel alloc] initWithFrame:CGRectMake(32, 276, w - 64, 22)];
+    filterTitle.text = @"滤波模式";
+    filterTitle.font = [UIFont systemFontOfSize:16];
+    [content addSubview:filterTitle];
 
     self.filterSeg = [[UISegmentedControl alloc] initWithItems:@[@"心跳 20~250Hz", @"宽带 80~1kHz", @"原始"]];
-    self.filterSeg.frame = CGRectMake(32, 396, w - 64, 34);
+    self.filterSeg.frame = CGRectMake(32, 300, w - 64, 32);
     self.filterSeg.selectedSegmentIndex = 0;
     [self.filterSeg addTarget:self action:@selector(onFilterChange:) forControlEvents:UIControlEventValueChanged];
-    [root addSubview:self.filterSeg];
+    [content addSubview:self.filterSeg];
 
-    UITextView *notes = [[UITextView alloc] initWithFrame:CGRectMake(24, 450, w - 48, 240)];
+    UILabel *waveTitle = [[UILabel alloc] initWithFrame:CGRectMake(32, 344, w - 64, 20)];
+    waveTitle.text = @"实时波形";
+    waveTitle.font = [UIFont systemFontOfSize:15];
+    [content addSubview:waveTitle];
+
+    self.liveWave = [[WaveView alloc] initWithFrame:CGRectMake(16, 368, w - 32, 120)];
+    [content addSubview:self.liveWave];
+
+    UILabel *zoomTitle = [[UILabel alloc] initWithFrame:CGRectMake(32, 498, 80, 22)];
+    zoomTitle.text = @"波形放大";
+    zoomTitle.font = [UIFont systemFontOfSize:15];
+    [content addSubview:zoomTitle];
+
+    self.zoomSlider = [[UISlider alloc] initWithFrame:CGRectMake(116, 494, w - 200, 32)];
+    self.zoomSlider.minimumValue = 0;
+    self.zoomSlider.maximumValue = 7;
+    self.zoomSlider.value = 0;
+    [self.zoomSlider addTarget:self action:@selector(onZoomChange:) forControlEvents:UIControlEventValueChanged];
+    [content addSubview:self.zoomSlider];
+
+    self.zoomValueLabel = [[UILabel alloc] initWithFrame:CGRectMake(w - 78, 498, 64, 22)];
+    self.zoomValueLabel.text = @"1x";
+    self.zoomValueLabel.font = [UIFont systemFontOfSize:15];
+    self.zoomValueLabel.textAlignment = NSTextAlignmentRight;
+    self.zoomValueLabel.textColor = [UIColor secondaryLabelColor];
+    [content addSubview:self.zoomValueLabel];
+
+    UILabel *recTitle = [[UILabel alloc] initWithFrame:CGRectMake(32, 538, w - 120, 24)];
+    recTitle.text = @"录音保存（监听时录制 WAV）";
+    recTitle.font = [UIFont systemFontOfSize:15];
+    [content addSubview:recTitle];
+
+    self.recordSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(w - 92, 532, 60, 32)];
+    self.recordSwitch.on = NO;
+    [self.recordSwitch addTarget:self action:@selector(onRecordChange:) forControlEvents:UIControlEventValueChanged];
+    [content addSubview:self.recordSwitch];
+
+    self.recFileLabel = [[UILabel alloc] initWithFrame:CGRectMake(32, 566, w - 64, 18)];
+    self.recFileLabel.font = [UIFont systemFontOfSize:11];
+    self.recFileLabel.textColor = [UIColor tertiaryLabelColor];
+    self.recFileLabel.text = @"";
+    [content addSubview:self.recFileLabel];
+
+    self.playButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.playButton.frame = CGRectMake(32, 594, w - 64, 46);
+    self.playButton.layer.cornerRadius = 10;
+    self.playButton.backgroundColor = [UIColor secondarySystemFillColor];
+    self.playButton.tintColor = [UIColor labelColor];
+    self.playButton.titleLabel.font = [UIFont systemFontOfSize:16 weight:UIFontWeightMedium];
+    [self.playButton setTitle:@"回放最近录音" forState:UIControlStateNormal];
+    [self.playButton addTarget:self action:@selector(onPlayToggle) forControlEvents:UIControlEventTouchUpInside];
+    [content addSubview:self.playButton];
+
+    self.playWave = [[WaveView alloc] initWithFrame:CGRectMake(16, 648, w - 32, 110)];
+    [content addSubview:self.playWave];
+
+    UITextView *notes = [[UITextView alloc] initWithFrame:CGRectMake(24, 772, w - 48, 180)];
     notes.editable = NO;
     notes.scrollEnabled = NO;
     notes.backgroundColor = [UIColor clearColor];
     notes.font = [UIFont systemFontOfSize:13];
     notes.textColor = [UIColor secondaryLabelColor];
-    notes.text = @"使用说明：\n1. 先连接蓝牙耳机，再点「开始监听」\n2. 默认「心跳模式」专收低频心音，环境声大时用它\n3. 麦克风孔压紧身体、手掌罩住密封，安静房间\n4. 蓝牙链路有约0.2~0.4秒延迟，属正常现象\n5. 增益过大可能啸叫，注意扬声器音量\n6. 仅实时监听辅助，不录音不上传，不替代医疗诊断";
-    [root addSubview:notes];
+    notes.text = @"使用说明：\n1. 先连接蓝牙耳机，再点「开始监听」\n2. 默认「心跳模式」专收低频心音，环境声大时用它\n3. 麦克风孔压紧身体、手掌罩住密封，安静房间\n4. 波形放大调到 6x~8x 更容易看到心跳的规律波包\n5. 打开「录音保存」可回放；文件在 文档/Recordings\n6. 蓝牙延迟约0.2~0.4秒属正常；增益过大可能啸叫\n7. 仅实时监听辅助，不替代医疗诊断";
+    [content addSubview:notes];
+}
+
+// 实时波形 UI 刷新（主线程定时器）
+- (void)refreshWaveUI {
+    if (!self.running) return;
+    static float full[600];
+    static float win[600];
+    [_waveLock lock];
+    for (int i = 0; i < 600; i++) {
+        int src = (int)((i * 1200) / 600);
+        full[i] = _waveRing[(_wavePos + src) % 1200];
+    }
+    [_waveLock unlock];
+    NSInteger zoom = (NSInteger)self.zoomSlider.value + 1;
+    NSInteger winN = MAX(60, 600 / zoom);
+    for (NSInteger i = 0; i < winN; i++) win[i] = full[600 - winN + i];
+    [self.liveWave setData:win length:(NSUInteger)winN level:_level];
 }
 
 // ------------------------------------------------------------------ 音频
@@ -147,6 +328,30 @@
     } else {
         [self startMonitor];
     }
+}
+
+- (NSURL *)recordingsDir {
+    NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
+    NSURL *dir = [docs URLByAppendingPathComponent:@"Recordings"];
+    [[NSFileManager defaultManager] createDirectoryAtURL:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    return dir;
+}
+
+- (NSURL *)latestRecording {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *files = [fm contentsOfDirectoryAtURL:[self recordingsDir] includingPropertiesForKeys:@[NSURLContentModificationDateKey] options:0 error:nil];
+    NSURL *best = nil;
+    NSDate *bestDate = nil;
+    for (NSURL *f in files) {
+        if (![f.pathExtension.lowercaseString isEqualToString:@"wav"]) continue;
+        NSDate *d = nil;
+        [f getResourceValue:&d forKey:NSURLContentModificationDateKey error:nil];
+        if (best == nil || [d compare:bestDate] == NSOrderedDescending) {
+            best = f;
+            bestDate = d;
+        }
+    }
+    return best;
 }
 
 - (void)startMonitor {
@@ -184,6 +389,7 @@
         [self setStatus:@"无法获取麦克风格式"];
         return;
     }
+    _inFmt = inFmt;
     [self.engine connect:self.player to:self.engine.mainMixerNode format:inFmt];
 
     // 按实际采样率计算滤波系数
@@ -218,6 +424,8 @@
     [self.player play];
 
     self.running = YES;
+    // 若开关已打开则开始录音
+    if (self.recordSwitch.on) [self startRecording];
     UIApplication.sharedApplication.idleTimerDisabled = YES; // 屏幕常亮
     [self.toggleButton setTitle:@"停止监听" forState:UIControlStateNormal];
     [self setStatus:[NSString stringWithFormat:@"监听中 · 输出：%@ · 延迟约0.2~0.4秒", [self currentOutputName]]];
@@ -228,6 +436,7 @@
     if (!self.running) return;
     NSLog(@"[FetalEar] 停止监听");
     self.running = NO;
+    [self stopRecording];
 
     [self.engine.inputNode removeTapOnBus:0];
     [self.player stop];
@@ -242,6 +451,38 @@
     UIApplication.sharedApplication.idleTimerDisabled = NO;
     [self.toggleButton setTitle:@"开始监听" forState:UIControlStateNormal];
     [self setStatus:@"已停止"];
+}
+
+// 录音：AVAudioFile 直接写 WAV（录的是滤波+增益后的信号，与听到的一致）
+- (void)startRecording {
+    if (self.recording) return;
+    if (_inFmt == nil) return;
+    NSDateFormatter *df = [[NSDateFormatter alloc] init];
+    df.dateFormat = @"yyyyMMdd_HHmmss";
+    NSString *ts = [df stringFromDate:[NSDate date]];
+    NSURL *url = [[self recordingsDir] URLByAppendingPathComponent:[NSString stringWithFormat:@"fetal_%@.wav", ts]];
+    NSError *err = nil;
+    AVAudioFile *f = [[AVAudioFile alloc] initForWriting:url
+                                                settings:_inFmt.settings
+                                            commonFormat:AVAudioPCMFormatFloat32
+                                             interleaved:NO
+                                                   error:&err];
+    if (f == nil) {
+        NSLog(@"[FetalEar] 录音创建失败: %@", err);
+        return;
+    }
+    self.recURL = url;
+    self.recFile = f;
+    self.recording = YES;
+    self.recFileLabel.text = [NSString stringWithFormat:@"录音中：%@", url.lastPathComponent];
+}
+
+- (void)stopRecording {
+    if (!self.recording) return;
+    self.recording = NO;
+    self.recFile = nil;
+    self.recFileLabel.text = @"";
+    NSLog(@"[FetalEar] 录音已停止");
 }
 
 // 音频回调：只做轻量 DSP（滤波+增益），不做任何磁盘/分配重活
@@ -286,10 +527,30 @@
             if (v > 1.0f) v = 1.0f;
             else if (v < -1.0f) v = -1.0f;
             p[i] = v;
+            // 每24个样本推一个点到波形环（声道0）
+            if (c == 0 && (i % 24) == 0) {
+                [_waveLock lock];
+                _waveRing[_wavePos] = v;
+                _wavePos = (_wavePos + 1) % 1200;
+                [_waveLock unlock];
+            }
         }
         _filtXP[c] = xp;
         _filtYPH[c] = ypH;
         _filtYPL[c] = ypL;
+    }
+
+    // RMS 电平（声道0）
+    if (frames > 0) {
+        float sum2 = 0;
+        float *p0 = channels[0];
+        for (NSUInteger i = 0; i < frames; i++) sum2 += p0[i] * p0[i];
+        _level = sqrtf(sum2 / (float)frames);
+    }
+
+    // 录音（处理后的同一 buffer）
+    if (self.recording && self.recFile != nil) {
+        [self.recFile writeFromBuffer:buf error:nil];
     }
 
     // 就地回放（处理后的同一个buffer调度到播放节点）
@@ -313,6 +574,7 @@
         if (!self.running) return;
         [self stopMonitor];
         [self startMonitor];
+        // startMonitor 内部会按开关恢复录音
     });
 }
 
@@ -349,6 +611,84 @@
 - (void)onFilterChange:(UISegmentedControl *)seg {
     self.filterMode = seg.selectedSegmentIndex;
     NSLog(@"[FetalEar] 滤波模式: %ld", (long)seg.selectedSegmentIndex);
+}
+
+- (void)onZoomChange:(UISlider *)slider {
+    self.zoomValueLabel.text = [NSString stringWithFormat:@"%ldx", (long)slider.value + 1];
+}
+
+- (void)onRecordChange:(UISwitch *)sw {
+    if (sw.on) {
+        if (self.running) [self startRecording];
+    } else {
+        [self stopRecording];
+    }
+}
+
+- (void)onPlayToggle {
+    if (self.audioPlayer != nil) {
+        [self.audioPlayer stop];
+        self.audioPlayer = nil;
+        [self.playButton setTitle:@"回放最近录音" forState:UIControlStateNormal];
+        if (self.running) {
+            [self setStatus:[NSString stringWithFormat:@"监听中 · 输出：%@ · 延迟约0.2~0.4秒", [self currentOutputName]]];
+        } else {
+            [self setStatus:@"已停止"];
+        }
+        return;
+    }
+    NSURL *url = [self latestRecording];
+    if (url == nil) {
+        [self setStatus:@"还没有录音：先打开「录音保存」再监听一会儿"];
+        return;
+    }
+    // 后台读取整段录音画峰值波形
+    NSURL *waveURL = url;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSError *err = nil;
+        AVAudioFile *f = [[AVAudioFile alloc] initForReading:waveURL error:&err];
+        if (f == nil) return;
+        AVAudioFormat *fmt = f.processingFormat;
+        AVAudioFrameCount frames = (AVAudioFrameCount)f.length;
+        if (frames == 0) return;
+        AVAudioPCMBuffer *buf = [[AVAudioPCMBuffer alloc] initWithPCMFormat:fmt frameCapacity:frames];
+        if (buf == nil) return;
+        [f readIntoBuffer:buf error:&err];
+        float *ch = buf.floatChannelData[0];
+        float peaks[600];
+        AVAudioFrameCount n = buf.frameLength;
+        for (int i = 0; i < 600; i++) {
+            AVAudioFrameCount s = (AVAudioFrameCount)(((int64_t)i) * n / 600);
+            AVAudioFrameCount e = (AVAudioFrameCount)(((int64_t)i + 1) * n / 600);
+            float peak = 0;
+            for (AVAudioFrameCount j = s; j < e; j++) {
+                float v = fabsf(ch[j]);
+                if (v > peak) peak = v;
+            }
+            peaks[i] = peak;
+        }
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self.playWave setData:peaks length:600 level:0];
+        });
+    });
+    NSError *perr = nil;
+    AVAudioPlayer *p = [[AVAudioPlayer alloc] initWithContentsOfURL:waveURL error:&perr];
+    if (p == nil) {
+        [self setStatus:@"回放失败"];
+        return;
+    }
+    self.audioPlayer = p;
+    p.delegate = self;
+    [p play];
+    [self.playButton setTitle:@"停止回放" forState:UIControlStateNormal];
+    [self setStatus:[NSString stringWithFormat:@"回放中：%@", url.lastPathComponent]];
+}
+
+- (void)audioPlayerDidFinishPlaying:(AVAudioPlayer *)player successfully:(BOOL)flag {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        self.audioPlayer = nil;
+        [self.playButton setTitle:@"回放最近录音" forState:UIControlStateNormal];
+    });
 }
 
 @end
