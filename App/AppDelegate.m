@@ -91,8 +91,9 @@
 @property (nonatomic, strong) AVAudioPlayerNode *player;
 @property (nonatomic, assign) BOOL running;
 // 参数（跨线程原子访问）
-@property (atomic, assign) float gain;        // 0.5 ~ 10.0
-// 滤波模式：0=原始(仅40Hz高通去直流) 1=宽带80~1kHz 2=心跳20~250Hz（默认）
+@property (atomic, assign) float gain;        // 0.5 ~ 20.0
+// 滤波模式：0=原始（真正零处理，直通） 1=宽带80~1kHz 2=心跳20~250Hz
+// ★ 默认 0（原始）——用户要的是不降噪的原始声音
 @property (atomic, assign) NSInteger filterMode;
 // 录音
 @property (atomic, assign) BOOL recording;
@@ -101,7 +102,6 @@
 // 回放
 @property (nonatomic, strong) AVAudioPlayer *audioPlayer;
 // 滤波系数（按实际采样率在启动时计算）
-@property (atomic, assign) float aH40;
 @property (atomic, assign) float aH80;
 @property (atomic, assign) float aH20;
 @property (atomic, assign) float aL1k;
@@ -127,7 +127,7 @@
 - (BOOL)application:(UIApplication *)app
         didFinishLaunchingWithOptions:(NSDictionary *)launchOptions {
     self.gain = 3.0f;
-    self.filterMode = 2;
+    self.filterMode = 0;      // ★ 默认「原始」：不滤波，直通
     _waveLock = [[NSLock alloc] init];
     _wavePos = 0;
     memset(_waveRing, 0, sizeof(_waveRing));
@@ -214,24 +214,25 @@
 
     self.gainSlider = [[UISlider alloc] initWithFrame:CGRectMake(32, 206, w - 64, 36)];
     self.gainSlider.minimumValue = 0.5f;
-    self.gainSlider.maximumValue = 10.0f;
-    self.gainSlider.value = 3.0f;
+    self.gainSlider.maximumValue = 20.0f;     // ★ 最大 20 倍（用户要求）
+    self.gainSlider.value = 20.0f;            // ★ 默认拉满
     [self.gainSlider addTarget:self action:@selector(onGainChange:) forControlEvents:UIControlEventValueChanged];
     [content addSubview:self.gainSlider];
 
     self.gainLabel = [[UILabel alloc] initWithFrame:CGRectMake(32, 244, w - 64, 20)];
-    self.gainLabel.text = @"300%";
+    self.gainLabel.text = @"2000%";
     self.gainLabel.font = [UIFont systemFontOfSize:14];
     self.gainLabel.textAlignment = NSTextAlignmentCenter;
     self.gainLabel.textColor = [UIColor secondaryLabelColor];
     [content addSubview:self.gainLabel];
 
     UILabel *filterTitle = [[UILabel alloc] initWithFrame:CGRectMake(32, 276, w - 64, 22)];
-    filterTitle.text = @"滤波模式";
-    filterTitle.font = [UIFont systemFontOfSize:16];
+    filterTitle.text = @"滤波模式（默认原始＝完全不处理）";
+    filterTitle.font = [UIFont systemFontOfSize:15];
     [content addSubview:filterTitle];
 
-    self.filterSeg = [[UISegmentedControl alloc] initWithItems:@[@"心跳 20~250Hz", @"宽带 80~1kHz", @"原始"]];
+    // ★ 「原始」放第一项并默认选中：进去就是零处理直通
+    self.filterSeg = [[UISegmentedControl alloc] initWithItems:@[@"原始", @"宽带 80~1kHz", @"心跳 20~250Hz"]];
     self.filterSeg.frame = CGRectMake(32, 300, w - 64, 32);
     self.filterSeg.selectedSegmentIndex = 0;
     [self.filterSeg addTarget:self action:@selector(onFilterChange:) forControlEvents:UIControlEventValueChanged];
@@ -299,7 +300,7 @@
     notes.backgroundColor = [UIColor clearColor];
     notes.font = [UIFont systemFontOfSize:13];
     notes.textColor = [UIColor secondaryLabelColor];
-    notes.text = @"使用说明：\n1. 先连接蓝牙耳机，再点「开始监听」\n2. 默认「心跳模式」专收低频心音，环境声大时用它\n3. 麦克风孔压紧身体、手掌罩住密封，安静房间\n4. 波形放大调到 6x~8x 更容易看到心跳的规律波包\n5. 打开「录音保存」可回放；文件在 文档/Recordings\n6. 蓝牙延迟约0.2~0.4秒属正常；增益过大可能啸叫\n7. 仅实时监听辅助，不替代医疗诊断";
+    notes.text = @"使用说明：\n1. 先连接蓝牙耳机，再点「开始监听」\n2. 默认「原始」模式：不降噪、不滤波，麦克风声音直接放大\n3. 环境噪声大时再切「心跳 20~250Hz」；想听中高频切「宽带」\n4. 增益最高 2000%（20倍），过大容易啸叫，先把耳机音量调小\n5. 麦克风孔压紧身体、手掌罩住密封，安静房间效果最好\n6. 打开「录音保存」可回放；文件在 文档/Recordings\n7. 蓝牙延迟约0.2~0.4秒属正常\n8. 仅实时监听辅助，不替代医疗诊断";
     [content addSubview:notes];
 }
 
@@ -394,7 +395,6 @@
 
     // 按实际采样率计算滤波系数
     double sr = inFmt.sampleRate;
-    self.aH40 = (float)exp(-2.0 * M_PI * 40.0 / sr);
     self.aH80 = (float)exp(-2.0 * M_PI * 80.0 / sr);
     self.aH20 = (float)exp(-2.0 * M_PI * 20.0 / sr);
     self.aL1k = (float)(1.0 - exp(-2.0 * M_PI * 1000.0 / sr));
@@ -485,7 +485,7 @@
     NSLog(@"[FetalEar] 录音已停止");
 }
 
-// 音频回调：只做轻量 DSP（滤波+增益），不做任何磁盘/分配重活
+// 音频回调：只做增益（原始模式）或滤波+增益，不做任何磁盘/分配重活
 - (void)processBuffer:(AVAudioPCMBuffer *)buf {
     if (!self.running) return;
     float **channels = buf.floatChannelData;
@@ -495,6 +495,7 @@
     float aH;
     float aL;
     BOOL useLp;
+
     if (mode == 2) {
         aH = self.aH20;   // 心跳模式：20~250Hz
         aL = self.aL250;
@@ -504,40 +505,64 @@
         aL = self.aL1k;
         useLp = YES;
     } else {
-        aH = self.aH40;   // 原始：仅去直流
+        // ★ 原始模式：零滤波。不高通、不低通、不去直流。
+        //   信号链就是 x * gain，跟麦克风出来的样本只差一个倍数。
+        //   直流偏置由麦克风本身保证极低（iPhone 的 ADC 带硬件 DC 阻断），
+        //   所以这里不需要软件再去直流。
+        aH = 0.0f;
         aL = 0.0f;
         useLp = NO;
     }
 
-    for (NSUInteger c = 0; c < buf.format.channelCount && c < 2; c++) {
-        float *p = channels[c];
-        float xp = _filtXP[c];
-        float ypH = _filtYPH[c];
-        float ypL = _filtYPL[c];
-        for (NSUInteger i = 0; i < frames; i++) {
-            float x = p[i];
-            float y = x - xp + aH * ypH;
-            xp = x;
-            ypH = y;
-            if (useLp) {
-                ypL += aL * (y - ypL);
-                y = ypL;
-            }
-            float v = y * g;
-            if (v > 1.0f) v = 1.0f;
-            else if (v < -1.0f) v = -1.0f;
-            p[i] = v;
-            // 每24个样本推一个点到波形环（声道0）
-            if (c == 0 && (i % 24) == 0) {
-                [_waveLock lock];
-                _waveRing[_wavePos] = v;
-                _wavePos = (_wavePos + 1) % 1200;
-                [_waveLock unlock];
+    if (!useLp && aH == 0.0f) {
+        // ===== 原始模式的快速路径：只有乘法和削顶，一个滤波运算都不做 =====
+        for (NSUInteger c = 0; c < buf.format.channelCount && c < 2; c++) {
+            float *p = channels[c];
+            for (NSUInteger i = 0; i < frames; i++) {
+                float v = p[i] * g;
+                // 硬削顶：超出满刻度的部分直接截断（原始模式下不做任何软压缩）
+                if (v > 1.0f) v = 1.0f;
+                else if (v < -1.0f) v = -1.0f;
+                p[i] = v;
+                if (c == 0 && (i % 24) == 0) {
+                    [_waveLock lock];
+                    _waveRing[_wavePos] = v;
+                    _wavePos = (_wavePos + 1) % 1200;
+                    [_waveLock unlock];
+                }
             }
         }
-        _filtXP[c] = xp;
-        _filtYPH[c] = ypH;
-        _filtYPL[c] = ypL;
+    } else {
+        // ===== 带滤波的路径（宽带 / 心跳模式）=====
+        for (NSUInteger c = 0; c < buf.format.channelCount && c < 2; c++) {
+            float *p = channels[c];
+            float xp = _filtXP[c];
+            float ypH = _filtYPH[c];
+            float ypL = _filtYPL[c];
+            for (NSUInteger i = 0; i < frames; i++) {
+                float x = p[i];
+                float y = x - xp + aH * ypH;
+                xp = x;
+                ypH = y;
+                if (useLp) {
+                    ypL += aL * (y - ypL);
+                    y = ypL;
+                }
+                float v = y * g;
+                if (v > 1.0f) v = 1.0f;
+                else if (v < -1.0f) v = -1.0f;
+                p[i] = v;
+                if (c == 0 && (i % 24) == 0) {
+                    [_waveLock lock];
+                    _waveRing[_wavePos] = v;
+                    _wavePos = (_wavePos + 1) % 1200;
+                    [_waveLock unlock];
+                }
+            }
+            _filtXP[c] = xp;
+            _filtYPH[c] = ypH;
+            _filtYPL[c] = ypL;
+        }
     }
 
     // RMS 电平（声道0）
